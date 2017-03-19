@@ -310,6 +310,10 @@ P0A7B8\tUniProtKB\tChain\t2\t176\t50\t+\t.\tID=PRO_0000148105
 P0A7B8\tUniProtKB\tChain\t2\t176\t50\t+\t.\tNote ATP-dependent;ID PRO_0000148105
 ";
 
+    // Another variant of GTF file, modified from a published GENCODE GTF file.
+    const GTF_FILE_2: &'static [u8] = b"chr1\tHAVANA\tgene\t11869\t14409\t.\t+\t.\tgene_id \"ENSG00000223972.5\"; gene_type \"transcribed_unprocessed_pseudogene\";
+chr1\tHAVANA\ttranscript\t11869\t14409\t.\t+\t.\tgene_id \"ENSG00000223972.5\"; transcript_id \"ENST00000456328.2\"; gene_type \"transcribed_unprocessed_pseudogene\"";
+
     //required because HashMap iter on element randomly
     const GTF_FILE_ONE_ATTRIB: &'static [u8] = b"P0A7B8\tUniProtKB\tInitiator methionine\t1\t1\t.\t.\t.\tNote Removed
 P0A7B8\tUniProtKB\tChain\t2\t176\t50\t+\t.\tID PRO_0000148105
@@ -332,6 +336,43 @@ P0A7B8\tUniProtKB\tChain\t2\t176\t50\t+\t.\tID PRO_0000148105
         attributes[1].insert("Note".to_owned(), "ATP-dependent protease subunit HslV".to_owned());
 
         let mut reader = Reader::new(GFF_FILE, GffType::GFF3);
+        for (i, r) in reader.records().enumerate() {
+            let record = r.ok().expect("Error reading record");
+            assert_eq!(record.seqname(), seqname[i]);
+            assert_eq!(record.source(), source[i]);
+            assert_eq!(record.feature_type(), feature_type[i]);
+            assert_eq!(*record.start(), starts[i]);
+            assert_eq!(*record.end(), ends[i]);
+            assert_eq!(record.score(), scores[i]);
+            assert_eq!(record.strand(), strand[i]);
+            assert_eq!(record.frame(), frame[i]);
+            assert_eq!(record.attributes(), &attributes[i]);
+        }
+    }
+
+    #[test]
+    fn test_reader_gtf2_2() {
+        let seqname = ["chr1", "chr1"];
+        let source = ["HAVANA", "HAVANA"];
+        let feature_type = ["gene", "transcript"];
+        let starts = [11869, 11869];
+        let ends = [14409, 14409];
+        let scores = [None, None];
+        let strand = [Some(Strand::Forward), Some(Strand::Forward)];
+        let frame = [".", "."];
+        let mut attributes = [HashMap::new(), HashMap::new()];
+        attributes[0].insert("gene_id".to_owned(),
+                             "ENSG00000223972.5".to_owned());
+        attributes[0].insert("gene_type".to_owned(),
+                             "transcribed_unprocessed_pseudogene".to_owned());
+        attributes[1].insert("gene_id".to_owned(),
+                             "ENSG00000223972.5".to_owned());
+        attributes[1].insert("transcript_id".to_owned(),
+                             "ENST00000456328.2".to_owned());
+        attributes[1].insert("gene_type".to_owned(),
+                             "transcribed_unprocessed_pseudogene".to_owned());
+
+        let mut reader = Reader::new(GTF_FILE_2, GffType::GTF2);
         for (i, r) in reader.records().enumerate() {
             let record = r.ok().expect("Error reading record");
             assert_eq!(record.seqname(), seqname[i]);
