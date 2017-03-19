@@ -104,24 +104,27 @@ impl<'a, R: io::Read> Iterator for Records<'a, R> {
         let (delim, termi) = self.gff_type.separator();
 
         self.inner.next().map(|res| {
-            res.map(|(seqname, source, feature_type, start, end, score, strand, frame, attributes)| {
-                Record {
-                    seqname: seqname,
-                    source: source,
-                    feature_type: feature_type,
-                    start: start,
-                    end: end,
-                    score: score,
-                    strand: strand,
-                    frame: frame,
-                    attributes: csv::Reader::from_string(attributes)
-                        .delimiter(delim)
-                        .record_terminator(csv::RecordTerminator::Any(termi))
-                        .has_headers(false)
-                        .decode()
-                        .collect::<csv::Result<_>>()
-                        .unwrap(),
-                }
+
+            res.and_then(|(seqname, source, feature_type, start, end, score, strand, frame, raw_attributes)| {
+                csv::Reader::from_string(raw_attributes)
+                    .delimiter(delim)
+                    .record_terminator(csv::RecordTerminator::Any(termi))
+                    .has_headers(false)
+                    .decode()
+                    .collect::<csv::Result<_>>()
+                    .map(|attributes| {
+                        Record {
+                            seqname: seqname,
+                            source: source,
+                            feature_type: feature_type,
+                            start: start,
+                            end: end,
+                            score: score,
+                            strand: strand,
+                            frame: frame,
+                            attributes: attributes,
+                        }
+                    })
             })
         })
     }
