@@ -25,11 +25,10 @@ use std::convert::AsRef;
 use itertools::Itertools;
 use regex::Regex;
 use multimap::MultiMap;
-use serde::{Serialize, Deserialize};
 
 use csv;
 
-use utils::Strand;
+use utils::{Interval, IntervalError, Strand, StrandError};
 
 /// `GffType`
 ///
@@ -85,73 +84,57 @@ impl<R: io::Read> Reader<R> {
         }
     }
 
-    /// Iterate over all records.
+    pub fn raw_rows(&mut self) -> RawRows<R> {
+        RawRows {
+            inner: self.inner.decode(),
+        }
+    }
+
     pub fn records(&mut self) -> Records<R> {
         let (delim, term) = self.gff_type.separator();
-        let r = format!(r" *(?P<key>[^{delim}{term}\t]+){delim}(?P<value>[^{delim}{term}\t]+){term}?",
-                    delim = delim as char,
-                    term = term as char);
-        let attribute_re = Regex::new(&r).unwrap();
+        let r = format!(
+            r" *(?P<key>[^{delim}{term}\t]+){delim}(?P<value>[^{delim}{term}\t]+){term}?",
+            delim = delim as char, term = term as char);
         Records {
-            inner: self.inner.decode(),
-            attribute_re: attribute_re,
+            inner: self.raw_rows(),
+            attributes_re: Regex::new(&r).unwrap(),
         }
     }
 }
 
 
-/// A GFF record.
-pub struct Records<'a, R: 'a + io::Read> {
-    inner: csv::DecodedRecords<'a,
-                               R,
-                               (String, String, String, u64, u64, String, String, String, String)>,
-    attribute_re: Regex,
+pub struct RawRows<'a, R: 'a + io::Read> {
+    inner: csv::DecodedRecords<'a, R, RawRow>,
 }
 
+impl<'a, R: io::Read> Iterator for RawRows<'a, R> {
 
-impl<'a, R: io::Read> Iterator for Records<'a, R> {
-    type Item = csv::Result<Record>;
+    type Item = Result<RawRow, GffError>;
 
-    fn next(&mut self) -> Option<csv::Result<Record>> {
-        self.inner
-            .next()
-            .map(|res| {
-                res.map(|(seqname,
-                          source,
-                          feature_type,
-                          start,
-                          end,
-                          score,
-                          strand,
-                          frame,
-                          raw_attributes)| {
-                    let trim_quotes = |s: &str| s.trim_matches('\'').trim_matches('"').to_owned();
-                    let mut attrs = MultiMap::new();
-                    for caps in self.attribute_re.captures_iter(&raw_attributes) {
-                        attrs.insert(trim_quotes(&caps["key"]), trim_quotes(&caps["value"]));
-                    }
-                    Record {
-                        seqname: seqname,
-                        source: source,
-                        feature_type: feature_type,
-                        start: start,
-                        end: end,
-                        score: score,
-                        strand: strand,
-                        frame: frame,
-                        attributes: attrs,
-                    }
-                })
-            })
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|csvr| csvr.map_err(GffError::from))
     }
 }
 
+pub struct Records<'a, R: 'a + io::Read> {
+    inner: RawRows<'a, R>,
+    attributes_re: Regex,
+}
+
+impl<'a, R: io::Read> Iterator for Records<'a, R> {
+
+    type Item = Result<Record, GffError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+            .map(|res| res.and_then(|row| Record::try_from(row, &self.attributes_re)))
+    }
+}
 
 /// A GFF writer.
 pub struct Writer<W: io::Write> {
     inner: csv::Writer<W>,
-    delimiter: char,
-    terminator: String,
+    gff_type: GffType,
 }
 
 
@@ -166,71 +149,234 @@ impl Writer<fs::File> {
 impl<W: io::Write> Writer<W> {
     /// Write to a given writer.
     pub fn new(writer: W, fileformat: GffType) -> Self {
-        let (delim, termi) = fileformat.separator();
-
         Writer {
             inner: csv::Writer::from_writer(writer)
                 .delimiter(b'\t')
                 .flexible(true),
-            delimiter: delim as char,
-            terminator: String::from_utf8(vec![termi]).unwrap(),
+            gff_type: fileformat,
         }
     }
 
-    /// Write a given GFF record.
-    pub fn write(&mut self, record: &Record) -> csv::Result<()> {
-        let attributes = if !record.attributes.is_empty() {
-            record
-                .attributes
-                .iter()
-                .map(|(a, b)| format!("{}{}{}", a, self.delimiter, b))
-                .join(&self.terminator)
-        } else {
-            "".to_owned()
-        };
-
+    pub fn write(&mut self, record: &Record) -> Result<(), GffError> {
         self.inner
-            .encode((&record.seqname,
-                     &record.source,
-                     &record.feature_type,
-                     record.start,
-                     record.end,
-                     &record.score,
-                     &record.strand,
-                     &record.frame,
-                     attributes))
+            .encode(record.to_raw_row(&self.gff_type))
+            .map_err(GffError::from)
     }
 }
 
+quick_error! {
 
-/// A GFF record
-#[derive(Default, Serialize, Deserialize)]
+    #[derive(Debug)]
+    pub enum GffError {
+        ParseFloat(err: ::std::num::ParseFloatError) {
+            description(err.description())
+            from()
+            cause(err)
+        }
+        ParseInt(err: ::std::num::ParseIntError) {
+            description(err.description())
+            from()
+            cause(err)
+        }
+        Interval(err: IntervalError) {
+            description(err.description())
+            from()
+            cause(err)
+        }
+        Strand(err: StrandError) {
+            description(err.description())
+            from()
+            cause(err)
+        }
+        Csv(err: csv::Error) {
+            description(err.description())
+            from()
+            cause(err)
+        }
+        InvalidFrame {
+            description("GFF record frame must be either 0, 1, 2, if defined.")
+        }
+    }
+}
+
+pub type RawRow = (String, String, String, u64, u64, String, char, char, String);
+
+#[derive(Serialize, Deserialize)]
 pub struct Record {
     seqname: String,
-    source: String,
-    feature_type: String,
-    start: u64,
-    end: u64,
-    score: String,
-    strand: String,
-    frame: String,
+    source: Option<String>,
+    feature_type: Option<String>,
+    interval: Interval<u64>,
+    score: Option<f64>,
+    strand: Strand,
+    frame: Option<u8>,
     attributes: MultiMap<String, String>,
 }
 
-impl Record {
-    /// Create a new GFF record.
-    pub fn new() -> Self {
-        Record {
-            seqname: "".to_owned(),
-            source: "".to_owned(),
-            feature_type: "".to_owned(),
-            start: 0,
-            end: 0,
-            score: ".".to_owned(),
-            strand: ".".to_owned(),
-            frame: "".to_owned(),
-            attributes: MultiMap::<String, String>::new(),
+pub struct RecordBuilder {
+    seqname: String,
+    start: u64,
+    end: u64,
+    source: Option<String>,
+    feature_type: Option<String>,
+    score: Option<String>,
+    strand: Option<char>,
+    frame: Option<char>,
+    attributes: MultiMap<String, String>,
+}
+
+impl RecordBuilder {
+
+    pub fn new<T>(seqname: T, start: u64, end: u64) -> Self
+        where T: Into<String>
+    {
+        RecordBuilder {
+            seqname: seqname.into(),
+            start: start,
+            end: end,
+            source: None,
+            feature_type: None,
+            score: None,
+            strand: None,
+            frame: None,
+            attributes: MultiMap::new(),
         }
+    }
+
+    pub fn source<T>(mut self, source: T) -> Self
+        where T: Into<String> + AsRef<str>
+    {
+        self.source = match source.as_ref() {
+            "." | "" => None,
+            v => Some(v.into()),
+        };
+        self
+    }
+
+    pub fn feature_type<T>(mut self, feature_type: T) -> Self
+        where T: Into<String> +  AsRef<str>
+    {
+        self.feature_type = match feature_type.as_ref() {
+            "." | "" => None,
+            v => Some(v.into()),
+        };
+        self
+    }
+
+    pub fn score<T>(mut self, raw_score: T) -> Self
+        where T: Into<String> + AsRef<str>
+    {
+        self.score = match raw_score.as_ref() {
+            "." | "" => None,
+            v => Some(v.into()),
+        };
+        self
+    }
+
+    pub fn strand(mut self, strand_char: char) -> Self {
+        self.strand = Some(strand_char);
+        self
+    }
+
+    pub fn frame(mut self, raw_frame: char) -> Self {
+        self.frame = match raw_frame {
+            '.' => None,
+            v => Some(v),
+        };
+        self
+    }
+
+    pub fn attributes(mut self, attributes: MultiMap<String ,String>) -> Self {
+        self.attributes = attributes;
+        self
+    }
+
+    pub fn build(self) -> Result<Record, GffError> {
+        let interval = Interval::new(self.start..self.end)
+            .map_err(GffError::from)?;
+
+        let rscore = self.score
+            .map(|ref rs| rs.parse::<f64>().map_err(GffError::from));
+        let score = match rscore {
+            Some(a) => Some(a?),
+            None => None,
+        };
+
+        let rstrand = self.strand
+            .map(|ref v| Strand::from_char(v).map_err(GffError::from));
+        let strand = match rstrand {
+            Some(a) => a?,
+            None => Strand::Unknown,
+        };
+
+
+        let rframe = self.frame
+            .map(|rf|
+                rf.to_string().parse::<u8>().map_err(GffError::from)
+                    .and_then(|num|
+                        if num > 2 {
+                            Err(GffError::InvalidFrame)
+                        } else {
+                            Ok(num)
+                        }
+                    )
+            );
+        let frame = match rframe {
+            Some(a) => Some(a?),
+            None => None,
+        };
+
+        let record = Record {
+            seqname: self.seqname,
+            interval: interval,
+            source: self.source,
+            feature_type: self.feature_type,
+            score: score,
+            strand: strand,
+            frame: frame,
+            attributes: self.attributes,
+        };
+        Ok(record)
+    }
+}
+
+impl Record {
+
+    fn try_from<'a>(row: RawRow, attributes_re: &Regex) -> Result<Self, GffError> {
+        let mut attrs = MultiMap::<String, String>::new();
+        let trim_quotes = |s: &str| s.trim_matches('\'').trim_matches('"').to_owned();
+        for caps in attributes_re.captures_iter(&row.8) {
+            attrs.insert(trim_quotes(&caps["key"]), trim_quotes(&caps["value"]));
+        }
+        RecordBuilder::new(row.0, row.3 - 1, row.4)
+            .source(row.1)
+            .feature_type(row.2)
+            .score(row.5)
+            .strand(row.6)
+            .frame(row.7)
+            .attributes(attrs)
+            .build()
+    }
+
+    pub fn to_raw_row(&self, gff_type: &GffType) -> RawRow {
+        let (delim, term) = gff_type.separator();
+        (self.seqname().to_owned(),
+         self.source().unwrap_or(".").to_owned(),
+         self.feature_type().unwrap_or(".").to_owned(),
+         self.start() + 1,  // start coordinate adjustment
+         self.end(),
+         self.score().map(|v| v.to_string()).unwrap_or(".".to_owned()),
+         match self.strand() {
+             Strand::Forward => '+',
+             Strand::Reverse => '-',
+             Strand::Unknown => '.',
+         },
+         self.frame().map(|v| (v + 48) as char).unwrap_or('.'),  // make 1u8 into '1', etc.
+         self.attributes()
+             .iter()
+             .map(|(a, b)| format!("{}{}{}", a, delim as char, b))
+             .join(::std::str::from_utf8(&[term + 48]).unwrap()),
+        )
     }
 
     /// Sequence name of the feature.
@@ -239,90 +385,102 @@ impl Record {
     }
 
     /// Source of the feature.
-    pub fn source(&self) -> &str {
-        &self.source
+    pub fn source(&self) -> Option<&str> {
+        self.source.as_ref().map(|ref v| v.as_str())
     }
 
     /// Type of the feature.
-    pub fn feature_type(&self) -> &str {
-        &self.feature_type
+    pub fn feature_type(&self) -> Option<&str> {
+        self.feature_type.as_ref().map(|ref v| v.as_str())
     }
 
-    /// Start position of feature (1-based).
-    pub fn start(&self) -> &u64 {
-        &self.start
+    /// Start position of feature (0-based).
+    pub fn start(&self) -> u64 {
+        self.interval.start
     }
 
-    /// End position of feature (1-based, not included).
-    pub fn end(&self) -> &u64 {
-        &self.end
+    /// End position of feature (0-based, not included).
+    pub fn end(&self) -> u64 {
+        self.interval.end
     }
 
-    /// Score of feature
-    pub fn score(&self) -> Option<u64> {
-        match self.score.as_ref() {
-            "." => None,
-            _ => self.score.parse::<u64>().ok(),
-        }
+    /// Score of feature.
+    pub fn score(&self) -> Option<f64> {
+        self.score
     }
 
     /// Strand of the feature.
-    pub fn strand(&self) -> Option<Strand> {
-        match self.strand.as_ref() {
-            "+" => Some(Strand::Forward),
-            "-" => Some(Strand::Reverse),
-            _ => None,
-        }
+    pub fn strand(&self) -> Strand {
+        self.strand
     }
 
     /// Frame of the feature.
-    pub fn frame(&self) -> &str {
-        &self.frame
+    pub fn frame(&self) -> Option<u8> {
+        self.frame
     }
 
-    /// Attribute of feature
+    /// Attribute of the feature.
     pub fn attributes(&self) -> &MultiMap<String, String> {
         &self.attributes
     }
 
-    /// Get mutable reference on seqname of feature.
-    pub fn seqname_mut(&mut self) -> &mut String {
-        &mut self.seqname
+    /// Set the seqname of feature.
+    pub fn set_seqname<T>(&mut self, seqname: T)
+        where T: Into<String>
+    {
+        self.seqname = seqname.into();
     }
 
-    /// Get mutable reference on source of feature.
-    pub fn source_mut(&mut self) -> &mut String {
-        &mut self.source
+    /// Set the source of feature.
+    pub fn set_source<T>(&mut self, source: T)
+        where T: Into<String> + AsRef<str>
+    {
+        self.source = match source.as_ref() {
+            "." | "" => None,
+            v => Some(v.into()),
+        };
     }
 
-    /// Get mutable reference on type of feature.
-    pub fn feature_type_mut(&mut self) -> &mut String {
-        &mut self.feature_type
+    /// Set the type of feature.
+    pub fn set_feature_type<T>(&mut self, feature_type: T)
+        where T: Into<String> +  AsRef<str>
+    {
+        self.feature_type = match feature_type.as_ref() {
+            "." | "" => None,
+            v => Some(v.into()),
+        };
     }
 
-    /// Get mutable reference on start of feature.
-    pub fn start_mut(&mut self) -> &mut u64 {
-        &mut self.start
+    /// Set the start and end coordinate of feature.
+    pub fn set_coords(&mut self, start: u64, end: u64) -> Result<(), GffError> {
+        let new_interval = Interval::new(start..end).map_err(GffError::from)?;
+        self.interval = new_interval;
+        Ok(())
     }
 
-    /// Get mutable reference on end of feature.
-    pub fn end_mut(&mut self) -> &mut u64 {
-        &mut self.end
+    /// Set the score of feature.
+    pub fn set_score(&mut self, score: f64) {
+        self.score = Some(score);
     }
 
-    /// Get mutable reference on score of feature.
-    pub fn score_mut(&mut self) -> &mut String {
-        &mut self.score
+    /// Set the strand of feature.
+    pub fn set_strand(&mut self, strand: Strand) {
+        self.strand = strand;
     }
 
-    /// Get mutable reference on strand of feature.
-    pub fn strand_mut(&mut self) -> &mut String {
-        &mut self.strand
+    /// Set the frame of feature.
+    pub fn set_frame(&mut self, frame: u8) -> Result<(), GffError> {
+        if frame > 2 {
+            Err(GffError::InvalidFrame)
+        } else {
+            self.frame = Some(frame);
+            Ok(())
+        }
     }
 
-    /// Get mutable reference on frame of feature.
-    pub fn frame_mut(&mut self) -> &mut String {
-        &mut self.frame
+    /// Set the attributes of feature.
+    pub fn set_attributes(&mut self, attributes: MultiMap<String, String>) {
+        self.attributes = attributes;
     }
 
     /// Get mutable reference on attributes of feature.
@@ -362,15 +520,43 @@ P0A7B8\tUniProtKB\tChain\t2\t176\t50\t+\t.\tID PRO_0000148105
 ";
 
     #[test]
-    fn test_reader_gff3() {
+    fn test_raw_rows() {
         let seqname = ["P0A7B8", "P0A7B8"];
         let source = ["UniProtKB", "UniProtKB"];
         let feature_type = ["Initiator methionine", "Chain"];
         let starts = [1, 2];
         let ends = [1, 176];
-        let scores = [None, Some(50)];
-        let strand = [None, Some(Strand::Forward)];
-        let frame = [".", "."];
+        let scores = [".", "50"];
+        let strand = ['.', '+'];
+        let frame = ['.', '.'];
+        let attributes = ["Note=Removed,ID=test",
+                          "Note=ATP-dependent protease subunit HslV,ID=PRO_0000148105"];
+
+        let mut reader = Reader::new(GFF_FILE, GffType::GFF3);
+        for (i, r) in reader.raw_rows().enumerate() {
+            let row = r.unwrap();
+            assert_eq!(row.0, seqname[i]);
+            assert_eq!(row.1, source[i]);
+            assert_eq!(row.2, feature_type[i]);
+            assert_eq!(row.3, starts[i]);
+            assert_eq!(row.4, ends[i]);
+            assert_eq!(row.5, scores[i]);
+            assert_eq!(row.6, strand[i]);
+            assert_eq!(row.7, frame[i]);
+            assert_eq!(row.8, attributes[i]);
+        }
+    }
+
+    #[test]
+    fn test_reader_gff3() {
+        let seqname = ["P0A7B8", "P0A7B8"];
+        let source = [Some("UniProtKB"), Some("UniProtKB")];
+        let feature_type = [Some("Initiator methionine"), Some("Chain")];
+        let starts = [0, 1];
+        let ends = [1, 176];
+        let scores = [None, Some(50f64)];
+        let strand = [Strand::Unknown, Strand::Forward];
+        let frame = [None, None];
         let mut attributes = [MultiMap::new(), MultiMap::new()];
         attributes[0].insert("ID".to_owned(), "test".to_owned());
         attributes[0].insert("Note".to_owned(), "Removed".to_owned());
@@ -384,10 +570,10 @@ P0A7B8\tUniProtKB\tChain\t2\t176\t50\t+\t.\tID PRO_0000148105
             assert_eq!(record.seqname(), seqname[i]);
             assert_eq!(record.source(), source[i]);
             assert_eq!(record.feature_type(), feature_type[i]);
-            assert_eq!(*record.start(), starts[i]);
-            assert_eq!(*record.end(), ends[i]);
+            assert_eq!(record.start(), starts[i]);
+            assert_eq!(record.end(), ends[i]);
             assert_eq!(record.score(), scores[i]);
-            assert_eq!(record.strand(), strand[i]);
+            assert!(record.strand().is_unknown() || record.strand() == strand[i]);
             assert_eq!(record.frame(), frame[i]);
             assert_eq!(record.attributes(), &attributes[i]);
         }
@@ -396,13 +582,13 @@ P0A7B8\tUniProtKB\tChain\t2\t176\t50\t+\t.\tID PRO_0000148105
     #[test]
     fn test_reader_gtf2() {
         let seqname = ["P0A7B8", "P0A7B8"];
-        let source = ["UniProtKB", "UniProtKB"];
-        let feature_type = ["Initiator methionine", "Chain"];
-        let starts = [1, 2];
+        let source = [Some("UniProtKB"), Some("UniProtKB")];
+        let feature_type = [Some("Initiator methionine"), Some("Chain")];
+        let starts = [0, 1];
         let ends = [1, 176];
-        let scores = [None, Some(50)];
-        let strand = [None, Some(Strand::Forward)];
-        let frame = [".", "."];
+        let scores = [None, Some(50f64)];
+        let strand = [Strand::Unknown, Strand::Forward];
+        let frame = [None, None];
         let mut attributes = [MultiMap::new(), MultiMap::new()];
         attributes[0].insert("ID".to_owned(), "test".to_owned());
         attributes[0].insert("Note".to_owned(), "Removed".to_owned());
@@ -415,10 +601,10 @@ P0A7B8\tUniProtKB\tChain\t2\t176\t50\t+\t.\tID PRO_0000148105
             assert_eq!(record.seqname(), seqname[i]);
             assert_eq!(record.source(), source[i]);
             assert_eq!(record.feature_type(), feature_type[i]);
-            assert_eq!(*record.start(), starts[i]);
-            assert_eq!(*record.end(), ends[i]);
+            assert_eq!(record.start(), starts[i]);
+            assert_eq!(record.end(), ends[i]);
             assert_eq!(record.score(), scores[i]);
-            assert_eq!(record.strand(), strand[i]);
+            assert!(record.strand().is_unknown() || record.strand() == strand[i]);
             assert_eq!(record.frame(), frame[i]);
             assert_eq!(record.attributes(), &attributes[i]);
         }
@@ -427,13 +613,13 @@ P0A7B8\tUniProtKB\tChain\t2\t176\t50\t+\t.\tID PRO_0000148105
     #[test]
     fn test_reader_gtf2_2() {
         let seqname = ["chr1", "chr1"];
-        let source = ["HAVANA", "HAVANA"];
-        let feature_type = ["gene", "transcript"];
-        let starts = [11869, 11869];
+        let source = [Some("HAVANA"), Some("HAVANA")];
+        let feature_type = [Some("gene"), Some("transcript")];
+        let starts = [11868, 11868];
         let ends = [14409, 14409];
         let scores = [None, None];
-        let strand = [Some(Strand::Forward), Some(Strand::Forward)];
-        let frame = [".", "."];
+        let strand = [Strand::Forward, Strand::Forward];
+        let frame = [None, None];
         let mut attributes = [MultiMap::new(), MultiMap::new()];
         attributes[0].insert("gene_id".to_owned(), "ENSG00000223972.5".to_owned());
         attributes[0].insert("gene_type".to_owned(),
@@ -449,10 +635,10 @@ P0A7B8\tUniProtKB\tChain\t2\t176\t50\t+\t.\tID PRO_0000148105
             assert_eq!(record.seqname(), seqname[i]);
             assert_eq!(record.source(), source[i]);
             assert_eq!(record.feature_type(), feature_type[i]);
-            assert_eq!(*record.start(), starts[i]);
-            assert_eq!(*record.end(), ends[i]);
+            assert_eq!(record.start(), starts[i]);
+            assert_eq!(record.end(), ends[i]);
             assert_eq!(record.score(), scores[i]);
-            assert_eq!(record.strand(), strand[i]);
+            assert!(record.strand().is_unknown() || record.strand() == strand[i]);
             assert_eq!(record.frame(), frame[i]);
             assert_eq!(record.attributes(), &attributes[i]);
         }
