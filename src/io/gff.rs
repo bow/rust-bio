@@ -157,9 +157,13 @@ impl<W: io::Write> Writer<W> {
         }
     }
 
-    pub fn write(&mut self, record: &Record) -> Result<(), GffError> {
-        self.inner
-            .encode(record.to_raw_row(&self.gff_type))
+    pub fn write_record(&mut self, record: &Record) -> Result<(), GffError> {
+        let gff_type = self.gff_type;
+        self.write_raw_row(&record.to_raw_row(&gff_type))
+    }
+
+    pub fn write_raw_row(&mut self, row: &RawRow) -> Result<(), GffError> {
+        self.inner.encode(row)
             .map_err(GffError::from)
     }
 }
@@ -662,7 +666,7 @@ P0A7B8\tUniProtKB\tChain\t2\t176\t50\t+\t.\tID PRO_0000148105
         let mut writer = Writer::new(vec![], GffType::GFF3);
         for r in reader.records() {
             writer
-                .write(&r.ok().expect("Error reading record"))
+                .write_record(&r.ok().expect("Error reading record"))
                 .ok()
                 .expect("Error writing record");
         }
@@ -676,7 +680,7 @@ P0A7B8\tUniProtKB\tChain\t2\t176\t50\t+\t.\tID PRO_0000148105
         let mut writer = Writer::new(vec![], GffType::GTF2);
         for r in reader.records() {
             writer
-                .write(&r.ok().expect("Error reading record"))
+                .write_record(&r.ok().expect("Error reading record"))
                 .ok()
                 .expect("Error writing record");
         }
@@ -690,7 +694,7 @@ P0A7B8\tUniProtKB\tChain\t2\t176\t50\t+\t.\tID PRO_0000148105
         let mut writer = Writer::new(vec![], GffType::GFF3);
         for r in reader.records() {
             writer
-                .write(&r.ok().expect("Error reading record"))
+                .write_record(&r.ok().expect("Error reading record"))
                 .ok()
                 .expect("Error writing record");
         }
